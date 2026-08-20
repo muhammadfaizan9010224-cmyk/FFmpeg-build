@@ -1,0 +1,171 @@
+name: Build Custom FFmpeg
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Set up MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            base-devel
+            autotools
+            git
+            nasm
+            yasm
+            pkgconf
+            mingw-w64-ucrt-x86_64-toolchain
+            mingw-w64-ucrt-x86_64-cmake
+            mingw-w64-ucrt-x86_64-x264
+            mingw-w64-ucrt-x86_64-x265
+            mingw-w64-ucrt-x86_64-svt-av1
+            mingw-w64-ucrt-x86_64-dav1d
+            mingw-w64-ucrt-x86_64-libvpx
+            mingw-w64-ucrt-x86_64-libwebp
+            mingw-w64-ucrt-x86_64-opus
+            mingw-w64-ucrt-x86_64-libvorbis
+            mingw-w64-ucrt-x86_64-lame
+            mingw-w64-ucrt-x86_64-libass
+            mingw-w64-ucrt-x86_64-libplacebo
+            mingw-w64-ucrt-x86_64-vulkan-headers
+            mingw-w64-ucrt-x86_64-vulkan-loader
+            mingw-w64-ucrt-x86_64-shaderc
+            mingw-w64-ucrt-x86_64-zimg
+            mingw-w64-ucrt-x86_64-ffnvcodec-headers
+            mingw-w64-ucrt-x86_64-amf-headers
+            mingw-w64-ucrt-x86_64-libvpl
+
+      - name: Build libfdk_aac from source
+        shell: msys2 {0}
+        run: |
+          git clone --depth 1 https://github.com/mstorsjo/fdk-aac.git
+          cd fdk-aac
+          autoreconf -fiv
+          ./configure --prefix=/ucrt64 --disable-shared --enable-static
+          make -j$(nproc)
+          make install
+
+      - name: Fetch FFmpeg source
+        shell: msys2 {0}
+        run: git clone --depth 1 https://git.ffmpeg.org/ffmpeg.git ffmpeg-src
+
+      - name: Configure FFmpeg
+        shell: msys2 {0}
+        working-directory: ffmpeg-src
+        run: |
+          export PKG_CONFIG_PATH="/ucrt64/lib/pkgconfig"
+          ./configure \
+            --prefix=/ucrt64 \
+            --pkg-config-flags="--static" \
+            --extra-libs="-lpthread" \
+            --disable-w32threads \
+            --enable-gpl \
+            --enable-version3 \
+            --enable-nonfree \
+            --enable-static \
+            --disable-shared \
+            --disable-debug \
+            --disable-doc \
+            --disable-ffplay \
+            --enable-ffmpeg \
+            --enable-ffprobe \
+            --enable-libx264 \
+            --enable-libx265 \
+            --enable-libsvtav1 \
+            --enable-libdav1d \
+            --enable-libvpx \
+            --enable-libwebp \
+            --enable-libopus \
+            --enable-libvorbis \
+            --enable-libmp3lame \
+            --enable-libfdk-aac \
+            --enable-libass \
+            --enable-libplacebo \
+            --enable-vulkan \
+            --enable-libshaderc \
+            --enable-libzimg \
+            --enable-amf \
+            --enable-ffnvcodec \
+            --enable-nvenc \
+            --enable-nvdec \
+            --enable-cuvid \
+            --enable-d3d11va \
+            --enable-dxva2 \
+            --enable-libvpl \
+            --enable-zlib \
+            --enable-iconv
+
+      - name: Compile
+        shell: msys2 {0}
+        working-directory: ffmpeg-src
+        run: make -j$(nproc)
+
+      - name: Show what got built
+        shell: msys2 {0}
+        working-directory: ffmpeg-src
+        run: |
+          ls -lh ffmpeg.exe ffprobe.exe
+          ./ffmpeg.exe -version
+          echo "--- Verifying every encoder VideoConverter.ps1 actually uses is present ---"
+          MISSING=0
+          for enc in libx264 libx265 libsvtav1 libvpx-vp9 libwebp libopus libvorbis \
+                     libmp3lame libfdk_aac aac ac3 eac3 flac mjpeg png prores_ks \
+                     mpeg2video mpeg4 h264_nvenc hevc_nvenc av1_nvenc h264_amf \
+                     hevc_amf av1_amf h264_qsv hevc_qsv av1_qsv vp9_qsv; do
+              if ! ./ffmpeg.exe -encoders 2>&1 | grep -qE "\b${enc}\b"; then
+                  echo "MISSING ENCODER: $enc"
+                  MISSING=1
+              fi
+          done
+          if [ "$MISSING" -eq 1 ]; then
+              echo "One or more encoders VideoConverter.ps1 depends on did not compile in - failing the build."
+              exit 1
+          fi
+          echo "All required encoders present."
+          echo "--- Hardware decode/vendor-neutral acceleration inventory (informational only) ---"
+          # This build isn't tied to today's GPU - it's meant to keep working
+          # whichever vendor a future card comes from. Not a hard gate (unlike
+          # the encoder check above): decoder/hwaccel/filter names can shift
+          # between FFmpeg releases since this clones live git master each
+          # run, so a rename here shouldn't fail the whole build - just report
+          # what's actually present this time so it's visible in the log.
+          echo "[NVIDIA - NVDEC/CUVID]"
+          ./ffmpeg.exe -decoders 2>&1 | grep -iE 'cuvid' || echo "  none found"
+          echo "[Intel QSV - decode]"
+          ./ffmpeg.exe -decoders 2>&1 | grep -iE '_qsv' || echo "  none found"
+          echo "[AMD AMF - decode (AMFDEC) + filters]"
+          ./ffmpeg.exe -decoders 2>&1 | grep -iE '_amf' || echo "  no dedicated AMF decoder in this FFmpeg build (normal on older FFmpeg - falls back to D3D11VA/DXVA2 below)"
+          ./ffmpeg.exe -filters 2>&1 | grep -iE 'amf' || echo "  no amf-specific filters (vpp_amf/sr_amf) in this FFmpeg build"
+          echo "[Vendor-neutral Windows decode paths - work on ANY GPU vendor via the driver]"
+          ./ffmpeg.exe -hwaccels 2>&1 | grep -iE 'd3d11va|dxva2|vulkan|cuda' || echo "  none found"
+
+      - name: Bundle required DLLs
+        shell: msys2 {0}
+        working-directory: ffmpeg-src
+        run: |
+          # --enable-static only makes FFmpeg's OWN libraries static - the
+          # third-party libraries installed via pacman (libass, dav1d, etc.)
+          # are mostly DLL-only in MSYS2, so ffmpeg.exe/ffprobe.exe still need
+          # those DLLs at runtime. ldd finds the complete, real dependency
+          # list (including indirect/transitive ones) rather than guessing.
+          mkdir -p dist
+          cp ffmpeg.exe ffprobe.exe dist/
+          for exe in ffmpeg.exe ffprobe.exe; do
+              ldd "$exe" | grep -i '/ucrt64/bin/' | awk '{print $3}'
+          done | sort -u | while read -r dll; do
+              cp -n "$dll" dist/ 2>/dev/null || true
+          done
+          echo "Bundled files:"
+          ls -lh dist/
+
+      - name: Upload result
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-custom-build
+          path: ffmpeg-src/dist/*
+          retention-days: 7
